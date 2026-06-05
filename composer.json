@@ -10,6 +10,8 @@
     "license": "MIT",
     "require": {
         "php": "^8.3",
+        "google-gemini-php/laravel": "^2.0",
+        "google/apiclient": "^2.19",
         "laravel/framework": "^13.8",
         "laravel/tinker": "^3.0"
     },
@@ -81,12 +83,14 @@
         "preferred-install": "dist",
         "sort-packages": true,
         "audit": {
+            "block-insecure": false,
             "ignore": {
                 "PKSA-mdq4-51ck-6kdq": "*"
             }
         },
         "allow-plugins": {
-            "pestphp/pest-plugin": true
+            "pestphp/pest-plugin": true,
+            "php-http/discovery": true
         }
     },
     "minimum-stability": "stable",
