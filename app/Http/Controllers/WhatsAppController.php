@@ -56,7 +56,7 @@ class WhatsAppController extends Controller
                 // 1. Identificar quién envía el mensaje
                 $usuarios = [
                     '5213221895263' => 'EMMA',
-                    '521XXXXXXXXXX' => 'ALE' // Sustituir por el número real cuando lo tengas
+                    '5213313306233' => 'ALE' // Sustituir por el número real cuando lo tengas
                 ];
 
                 $remitente = $usuarios[$telefonoEntrante] ?? 'Desconocido';
@@ -79,7 +79,7 @@ class WhatsAppController extends Controller
 
                 if ($datosProcesados) {
                     Log::info("¡Éxito! JSON generado por la IA:", $datosProcesados);
-                    // Mandar a Google Sheets 
+                    // Mandar a Google Sheets
                     $this->ejecutarAccionEnSheets($datosProcesados);
                 }
             }
@@ -159,11 +159,11 @@ class WhatsAppController extends Controller
 
         if ($datos['accion'] === 'insertar') {
 
-            $monto = $datos['monto'] ?? 0;
+            $monto = floatval($datos['monto'] ?? 0);
             $gastoEmma = 0;
             $gastoAle = 0;
 
-            // 2. Calcular la división según la regla de negocio
+            // 1. Calcular división de este gasto (columnas F y G)
             if ($datos['tipo_gasto'] === 'COMPARTIDO') {
                 $gastoEmma = $monto / 2;
                 $gastoAle = $monto / 2;
@@ -172,15 +172,20 @@ class WhatsAppController extends Controller
                 if ($datos['quien_pago'] === 'ALE') $gastoAle = $monto;
             }
 
-            // 3. Obtener los datos actuales para saber si es un nuevo día
+            // 2. Obtener datos históricos para saber cuántas filas existen actualmente
             $response = $service->spreadsheets_values->get($spreadsheetId, $rango);
-            $valores = $response->getValues();
+            $valores = $response->getValues() ?? [];
+            $totalFilasPrevias = count($valores);
+
             $ultimaFila = end($valores);
-            $ultimaFecha = $ultimaFila[0] ?? null; // La columna A es la fecha
+            $ultimaFecha = $ultimaFila[0] ?? null;
 
             $filasAInsertar = [];
 
-            // 4. Si la fecha es diferente, creamos el separador y cabeceras
+            // 3. Determinar en qué fila de Excel va a quedar nuestro nuevo dato
+            $filaDestino = $totalFilasPrevias + 1; // Por defecto, es la fila que sigue
+
+            // 4. Crear cabeceras si es un día nuevo
             if ($ultimaFecha !== $datos['fecha']) {
                 $filasAInsertar[] = ["", "", "", "", "", "", "", "", "", "", "", ""];
                 $filasAInsertar[] = [
@@ -188,9 +193,16 @@ class WhatsAppController extends Controller
                     "Gasto real Emma", "Gasto Real Ale", "", "Fecha",
                     "Balance diario EMMA", "Balance diario ALE", "Resumen del día"
                 ];
+                // Como agregamos 2 filas de separación/cabecera, nuestra fila destino real se mueve 2 lugares hacia abajo
+                $filaDestino += 2;
             }
 
-            // 5. Armamos la fila con los datos de este gasto
+            // 5. Construir las fórmulas dinámicas inyectando el número de la fila destino
+            $formulaEmma = '=SUMIFS(C:C, A:A, I' . $filaDestino . ', D:D, "EMMA") - SUMIFS(F:F, A:A, I' . $filaDestino . ')';
+            $formulaAle = '=SUMIFS(C:C, A:A, I' . $filaDestino . ', D:D, "ALE") - SUMIFS(G:G, A:A, I' . $filaDestino . ')';
+            $formulaResumen = '=IF(J' . $filaDestino . ' < 0, "EMMA DEBE A ALE $" & ABS(J' . $filaDestino . '), IF(J' . $filaDestino . ' > 0, "ALE DEBE A EMMA $" & J' . $filaDestino . ', "¡Están a mano hoy!"))';
+
+            // 6. Armar la fila completa (12 columnas) insertando los strings de las fórmulas
             $filasAInsertar[] = [
                 $datos['fecha'],
                 $datos['concepto'],
@@ -198,16 +210,24 @@ class WhatsAppController extends Controller
                 $datos['quien_pago'],
                 $datos['tipo_gasto'],
                 $gastoEmma,
-                $gastoAle
+                $gastoAle,
+                "",              // Columna H (separación vacía)
+                $datos['fecha'], // Columna I (necesaria para el criterio del SUMIFS)
+                $formulaEmma,    // Columna J
+                $formulaAle,     // Columna K
+                $formulaResumen  // Columna L
             ];
 
-            // 6. Enviamos a Google Sheets
+            // 7. Enviar a Sheets
             $body = new \Google\Service\Sheets\ValueRange(['values' => $filasAInsertar]);
-            $params = ['valueInputOption' => 'USER_ENTERED']; // Para que formatee números y fechas correctamente
+
+            // El parámetro 'USER_ENTERED' es la magia que hace que Sheets interprete
+            // los textos que empiezan con "=" como fórmulas reales y no como simple texto.
+            $params = ['valueInputOption' => 'USER_ENTERED'];
 
             $service->spreadsheets_values->append($spreadsheetId, $rango, $body, $params);
 
-            Log::info("Gasto insertado en Sheets exitosamente.");
+            Log::info("Gasto insertado exitosamente con fórmulas en la fila: " . $filaDestino);
         }
         elseif ($datos['accion'] === 'consultar') {
             // Aquí en un futuro puedes iterar sobre $valores para sumar los balances de $datos['fecha']
