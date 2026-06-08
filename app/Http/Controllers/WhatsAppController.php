@@ -56,7 +56,7 @@ class WhatsAppController extends Controller
                 // 1. Identificar quién envía el mensaje
                 $usuarios = [
                     '5213221895263' => 'EMMA',
-                    '5213313306233' => 'ALE' // Sustituir por el número real cuando lo tengas
+                    '5213311121184' => 'ALE' // Sustituir por el número real cuando lo tengas
                 ];
 
                 $remitente = $usuarios[$telefonoEntrante] ?? 'Desconocido';
@@ -122,7 +122,7 @@ class WhatsAppController extends Controller
             //     ->withSystemInstruction($systemPrompt)
             //     ->generateContent($mensajeTexto);
 
-            $response = Gemini::generativeModel(model: 'gemini-3.5-flash')->withSystemInstruction(Content::parse($systemPrompt))->generateContent($mensajeTexto);
+            $response = Gemini::generativeModel(model: 'gemini-2.5-flash')->withSystemInstruction(Content::parse($systemPrompt))->generateContent($mensajeTexto);
 
             // Limpiamos la respuesta en caso de que la IA agregue espacios o saltos de línea
             $textoLimpio = trim($response->text());
