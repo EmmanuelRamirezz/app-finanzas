@@ -12,10 +12,9 @@ use Google\Service\Sheets as GoogleSheets;
 class WhatsAppController extends Controller
 {
     //Valida el webhook de Meta (Petición GET)
-    public function verifyWebhook(Request $request)
+    public function verifyWebhook(Request $request)//get
     {
-        //get
-        $verifyToken = env('WHATSAPP_VERIFY_TOKEN');
+        $verifyToken = config('services.whatsapp.verify_token');
 
         $mode = $request->query('hub_mode');
         $token = $request->query('hub_verify_token');
@@ -24,7 +23,7 @@ class WhatsAppController extends Controller
         // Meta envía 'subscribe' cuando intentas registrar el webhook
         if ($mode === 'subscribe' && $token === $verifyToken) {
             // Meta exige que devuelvas exactamente el 'hub_challenge' como respuesta de texto plano
-            return response($challenge, 200);
+            return response($challenge, 200)->header('Content-Type', 'text/plain');
         }
 
         return response()->json(['error' => 'Token de verificación inválido'], 403);
@@ -35,9 +34,8 @@ class WhatsAppController extends Controller
      */
     public function receiveMessage(Request $request)
     {
-        //post
-        //Log::info('Payload de WhatsApp:', $request->all());
-        Log::info(json_encode($request->all()));
+        error_log('=== NUEVO WEBHOOK DE META ===');
+        error_log(json_encode($request->all()));
 
         $data = $request->all();
 
@@ -62,31 +60,89 @@ class WhatsAppController extends Controller
                 $remitente = $usuarios[$telefonoEntrante] ?? 'Desconocido';
 
                 // 2. Parsear el Timestamp a la zona horaria correcta
-                // Se formatea en 'd/m/Y' para coincidir exactamente con el formato de tu CSV
                 $fechaActual = \Carbon\Carbon::createFromTimestamp($timestamp)
                     ->timezone('America/Mexico_City')
                     ->format('d/m/Y');
 
-                // Para depurar, registramos los datos extraídos limpios
-                Log::info("Mensaje procesado:", [
-                    'remitente' => $remitente,
-                    'fecha'     => $fechaActual,
-                    'mensaje'   => $mensajeTexto
-                ]);
 
-                //NUEVO: Llamada a Gemini
-                $datosProcesados = $this->consultarIA($mensajeTexto, $remitente, $fechaActual);
+                // 🛠️ NUEVO: Envolvemos el procesamiento en un bloque try-catch controlado
+                try {
 
-                if ($datosProcesados) {
-                    Log::info("¡Éxito! JSON generado por la IA:", $datosProcesados);
-                    // Mandar a Google Sheets
-                    $this->ejecutarAccionEnSheets($datosProcesados);
+                    // Llamada a Gemini (La función que modificamos en el paso anterior)
+                    $datosProcesados = $this->consultarIA($mensajeTexto, $remitente, $fechaActual);
+
+                    if ($datosProcesados) {
+                        // Mandar a Google Sheets
+                        $this->ejecutarAccionEnSheets($datosProcesados);
+                    }
+                } catch (\Exception $e) {
+                    error_log('>>> ERROR FATAL EN LA LÓGICA: ' . $e->getMessage());
+                    // Verificamos si la excepción fue la de sobrecarga
+                    if (str_contains($e->getMessage(), 'GEMINI_OVERLOAD')) {
+
+                        Log::warning("Gemini saturado. Enviando mensaje de alerta a: " . $telefonoEntrante);
+
+                        $mensajeAviso = "🤖 ¡Hola! En este momento hay una saturación temporal en los servidores de Inteligencia Artificial y no pude procesar tu gasto. Por favor, intenta reenviar tu mensaje en un par de minutos.";
+
+                        // 🛡️ BLINDAJE NUEVO: Protegemos el envío de WhatsApp
+                        try {
+                            // ⚠️ IMPORTANTE: Asegúrate de que el método que usas para enviar
+                            // mensajes se llame realmente así en tu controlador.
+                            $this->enviarMensajeWhatsApp($telefonoEntrante, $mensajeAviso);
+                            Log::info("Mensaje de aviso enviado correctamente por WhatsApp.");
+                        } catch (\Throwable $th) {
+                            // Si falla el envío de WhatsApp, lo registramos pero NO rompemos la ejecución
+                            Log::error("Error crítico al intentar enviar el WhatsApp de aviso: " . $th->getMessage());
+                        }
+
+                    } else {
+                        Log::error("Error inesperado en el procesamiento: " . $e->getMessage());
+                    }
                 }
+                // 🛠️ FIN DEL TRATAMIENTO DE ERRORES
+
             }
         }
 
         // Siempre debes responder con un 200 OK rápido para que Meta no reintente el envío
+        // Al capturar el error arriba, el código llegará hasta aquí sin insertar nada en Excel
+        // y le dirá a Meta "Mensaje recibido, ya no lo reintentes".
         return response('EVENT_RECEIVED', 200);
+    }
+    private function enviarMensajeWhatsApp(string $numeroDestino, string $mensajeTexto)
+    {
+        // 1. Obtener credenciales (Asegúrate de tenerlas en tu archivo .env)
+        $token = env('WHATSAPP_VERIFY_TOKEN');
+        $phoneId = env('1672476820696747');
+        $versionGraph = 'v25.0'; // Usa la versión de la API que te haya asignado Meta
+
+        // 2. Construir la URL de la API de Meta
+        $url = "https://graph.facebook.com/{$versionGraph}/{$phoneId}/messages";
+
+        // 3. Armar el cuerpo del mensaje según la documentación de Meta
+        $payload = [
+            'messaging_product' => 'whatsapp',
+            'recipient_type' => 'individual',
+            'to' => $numeroDestino,
+            'type' => 'text',
+            'text' => [
+                'preview_url' => false,
+                'body' => $mensajeTexto
+            ]
+        ];
+
+        // 4. Enviar la petición HTTP a Meta
+        try {
+            $response = \Illuminate\Support\Facades\Http::withToken($token)
+                ->post($url, $payload);
+
+            if ($response->failed()) {
+                \Illuminate\Support\Facades\Log::error("Meta Cloud API rechazó el envío: " . $response->body());
+            }
+
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error("Error de conexión al enviar WhatsApp: " . $e->getMessage());
+        }
     }
 
     private function consultarIA(string $mensajeTexto, string $remitente, string $fechaActual): ?array
@@ -117,12 +173,9 @@ class WhatsAppController extends Controller
         }";
 
         try {
-            // Usamos el modelo flash que es rapidísimo y muy barato/gratis para texto
-            // $response = Gemini::gemini35Flash()
-            //     ->withSystemInstruction($systemPrompt)
-            //     ->generateContent($mensajeTexto);
-
-            $response = Gemini::generativeModel(model: 'gemini-2.5-flash')->withSystemInstruction(Content::parse($systemPrompt))->generateContent($mensajeTexto);
+            $response = Gemini::generativeModel(model: 'gemini-2.5-flash')
+                ->withSystemInstruction(Content::parse($systemPrompt))
+                ->generateContent($mensajeTexto);
 
             // Limpiamos la respuesta en caso de que la IA agregue espacios o saltos de línea
             $textoLimpio = trim($response->text());
@@ -140,7 +193,22 @@ class WhatsAppController extends Controller
             return null;
 
         } catch (\Exception $e) {
-            Log::error("Error al consultar a Gemini: " . $e->getMessage());
+            $mensajeError = $e->getMessage();
+
+            // 1. Detectar si el error es por saturación / alta demanda en Gemini
+            if (
+                str_contains($mensajeError, 'high demand') ||
+                str_contains($mensajeError, '503') ||
+                str_contains($mensajeError, 'Too Many Requests')
+            ) {
+                Log::warning("Gemini con alta demanda detectado en el servicio. Relanzando excepción controlada.");
+
+                // Lanzamos una excepción personalizada o relanzamos la misma para que el controlador la cachee
+                throw new \Exception("GEMINI_OVERLOAD: " . $mensajeError);
+            }
+
+            // Si es cualquier otro error (ej. error de sintaxis, credenciales, etc.), lo registramos normal
+            Log::error("Error al consultar a Gemini: " . $mensajeError);
             return null;
         }
     }
@@ -148,14 +216,31 @@ class WhatsAppController extends Controller
     private function ejecutarAccionEnSheets(array $datos)
     {
         // 1. Configurar cliente de Google
-        $client = new GoogleClient();
-        $client->setApplicationName('Finanzas Pareja');
-        $client->setScopes([GoogleSheets::SPREADSHEETS]);
-        $client->setAuthConfig(storage_path('app/google-credentials.json'));
+        // $client = new GoogleClient();
+        // $client->setApplicationName('Finanzas Pareja');
+        // $client->setScopes([GoogleSheets::SPREADSHEETS]);
+        // $client->setAuthConfig(storage_path('app/google-credentials.json'));
 
-        $service = new GoogleSheets($client);
-        $spreadsheetId = env('GOOGLE_SHEET_ID');
-        $rango = 'Sheet1'; // Cambia esto si tu pestaña en Google Sheets se llama "Hoja 1" o diferente
+        $client = new \Google_Client();
+        $client->setApplicationName('App Finanzas');
+        $client->setScopes([\Google_Service_Sheets::SPREADSHEETS]);
+
+        // 1. Leemos el secreto encriptado
+        $base64Credentials = config('services.google.credentials');
+
+        // 2. Lo decodificamos y lo convertimos de nuevo en un Array de PHP
+        $credentialsArray = json_decode(base64_decode($base64Credentials), true);
+
+        // 3. Autenticamos el cliente pasándole el Array en lugar del archivo físico
+        $client->setAuthConfig($credentialsArray);
+
+        $service = new \Google_Service_Sheets($client);
+
+        //$service = new GoogleSheets($client);
+        $spreadsheetId = config('services.google.spreadsheet_id');
+
+        $nombreHoja = 'Sheet1'; // Asegúrate de que coincida con tu pestaña
+        $rango = $nombreHoja;
 
         if ($datos['accion'] === 'insertar') {
 
@@ -163,46 +248,61 @@ class WhatsAppController extends Controller
             $gastoEmma = 0;
             $gastoAle = 0;
 
-            // 1. Calcular división de este gasto (columnas F y G)
+            // 1. Calcular división de este gasto
             if ($datos['tipo_gasto'] === 'COMPARTIDO') {
                 $gastoEmma = $monto / 2;
                 $gastoAle = $monto / 2;
             } else {
-                if ($datos['quien_pago'] === 'EMMA') $gastoEmma = $monto;
-                if ($datos['quien_pago'] === 'ALE') $gastoAle = $monto;
+                if ($datos['quien_pago'] === 'EMMA')
+                    $gastoEmma = $monto;
+                if ($datos['quien_pago'] === 'ALE')
+                    $gastoAle = $monto;
             }
 
-            // 2. Obtener datos históricos para saber cuántas filas existen actualmente
+            // 2. Obtener datos históricos
             $response = $service->spreadsheets_values->get($spreadsheetId, $rango);
             $valores = $response->getValues() ?? [];
             $totalFilasPrevias = count($valores);
 
-            $ultimaFila = end($valores);
-            $ultimaFecha = $ultimaFila[0] ?? null;
+            $ultimaFecha = null;
+            if ($totalFilasPrevias > 0) {
+                $ultimaFila = end($valores);
+                $ultimaFecha = $ultimaFila[0] ?? null;
+            }
 
             $filasAInsertar = [];
+            $esDiaNuevo = ($ultimaFecha !== $datos['fecha']);
 
-            // 3. Determinar en qué fila de Excel va a quedar nuestro nuevo dato
-            $filaDestino = $totalFilasPrevias + 1; // Por defecto, es la fila que sigue
+            // 3. Determinar en qué fila va a empezar la inserción
+            $filaInicioInsertar = $totalFilasPrevias + 1;
+            $filaDestino = $filaInicioInsertar;
 
             // 4. Crear cabeceras si es un día nuevo
-            if ($ultimaFecha !== $datos['fecha']) {
-                $filasAInsertar[] = ["", "", "", "", "", "", "", "", "", "", "", ""];
+            if ($esDiaNuevo) {
+                $filasAInsertar[] = ["", "", "", "", "", "", "", "", "", "", "", ""]; // Fila de separación
                 $filasAInsertar[] = [
-                    "Fecha", "Concepto", "Monto", "¿Quién pagó?", "Tipo de gasto",
-                    "Gasto real Emma", "Gasto Real Ale", "", "Fecha",
-                    "Balance diario EMMA", "Balance diario ALE", "Resumen del día"
+                    "Fecha",
+                    "Concepto",
+                    "Monto",
+                    "¿Quién pagó?",
+                    "Tipo de gasto",
+                    "Gasto real Emma",
+                    "Gasto Real Ale",
+                    "",
+                    "Fecha",
+                    "Balance diario EMMA",
+                    "Balance diario ALE",
+                    "Resumen del día"
                 ];
-                // Como agregamos 2 filas de separación/cabecera, nuestra fila destino real se mueve 2 lugares hacia abajo
                 $filaDestino += 2;
             }
 
-            // 5. Construir las fórmulas dinámicas inyectando el número de la fila destino
+            // 5. Fórmulas dinámicas
             $formulaEmma = '=SUMIFS(C:C, A:A, I' . $filaDestino . ', D:D, "EMMA") - SUMIFS(F:F, A:A, I' . $filaDestino . ')';
             $formulaAle = '=SUMIFS(C:C, A:A, I' . $filaDestino . ', D:D, "ALE") - SUMIFS(G:G, A:A, I' . $filaDestino . ')';
             $formulaResumen = '=IF(J' . $filaDestino . ' < 0, "EMMA DEBE A ALE $" & ABS(J' . $filaDestino . '), IF(J' . $filaDestino . ' > 0, "ALE DEBE A EMMA $" & J' . $filaDestino . ', "¡Están a mano hoy!"))';
 
-            // 6. Armar la fila completa (12 columnas) insertando los strings de las fórmulas
+            // 6. Armar fila de datos
             $filasAInsertar[] = [
                 $datos['fecha'],
                 $datos['concepto'],
@@ -211,26 +311,75 @@ class WhatsAppController extends Controller
                 $datos['tipo_gasto'],
                 $gastoEmma,
                 $gastoAle,
-                "",              // Columna H (separación vacía)
-                $datos['fecha'], // Columna I (necesaria para el criterio del SUMIFS)
-                $formulaEmma,    // Columna J
-                $formulaAle,     // Columna K
-                $formulaResumen  // Columna L
+                "",
+                $datos['fecha'],
+                $formulaEmma,
+                $formulaAle,
+                $formulaResumen
             ];
 
-            // 7. Enviar a Sheets
+            // 7. Enviar los valores (Datos) a Sheets
             $body = new \Google\Service\Sheets\ValueRange(['values' => $filasAInsertar]);
-
-            // El parámetro 'USER_ENTERED' es la magia que hace que Sheets interprete
-            // los textos que empiezan con "=" como fórmulas reales y no como simple texto.
             $params = ['valueInputOption' => 'USER_ENTERED'];
 
-            $service->spreadsheets_values->append($spreadsheetId, $rango, $body, $params);
+            $filasEnviadas = count($filasAInsertar);
+            $filaFinInsertar = $filaInicioInsertar + ($filasEnviadas - 1);
 
-            Log::info("Gasto insertado exitosamente con fórmulas en la fila: " . $filaDestino);
-        }
-        elseif ($datos['accion'] === 'consultar') {
-            // Aquí en un futuro puedes iterar sobre $valores para sumar los balances de $datos['fecha']
+            $rangoExacto = "'{$nombreHoja}'!A{$filaInicioInsertar}:L{$filaFinInsertar}";
+            $service->spreadsheets_values->update($spreadsheetId, $rangoExacto, $body, $params);
+
+            // 8. APLICAR DISEÑO (Colores pastel y Bordes) si es un día nuevo
+            if ($esDiaNuevo) {
+                // Generar un color aleatorio en tono pastel (RGB entre 0.85 y 1.0)
+                $r = mt_rand(85, 100) / 100;
+                $g = mt_rand(85, 100) / 100;
+                $b = mt_rand(85, 100) / 100;
+
+                // La fila de la cabecera será la fila de inicio + 1
+                // Nota: La API de diseño usa índices basados en 0 (la fila 1 es el índice 0)
+                $indiceFilaCabecera = $filaInicioInsertar; // Esto apunta a la fila de la cabecera (excluye la vacía)
+                $indiceFilaFin = $filaFinInsertar;       // Hasta el final de los datos insertados
+
+                $requests = [
+                    new \Google\Service\Sheets\Request([
+                        'repeatCell' => [
+                            'range' => [
+                                'sheetId' => 0, // ⚠️ 0 es el ID por defecto de la primera pestaña (Sheet1)
+                                'startRowIndex' => $indiceFilaCabecera,
+                                'endRowIndex' => $indiceFilaFin,       // Exclusivo
+                                'startColumnIndex' => 0,               // Columna A
+                                'endColumnIndex' => 12                 // Columna L (Exclusivo)
+                            ],
+                            'cell' => [
+                                'userEnteredFormat' => [
+                                    'backgroundColor' => [
+                                        'red' => $r,
+                                        'green' => $g,
+                                        'blue' => $b
+                                    ],
+                                    'borders' => [
+                                        'top' => ['style' => 'SOLID'],
+                                        'bottom' => ['style' => 'SOLID'],
+                                        'left' => ['style' => 'SOLID'],
+                                        'right' => ['style' => 'SOLID']
+                                    ]
+                                ]
+                            ],
+                            'fields' => 'userEnteredFormat(backgroundColor,borders)'
+                        ]
+                    ])
+                ];
+
+                $batchUpdateRequest = new \Google\Service\Sheets\BatchUpdateSpreadsheetRequest([
+                    'requests' => $requests
+                ]);
+
+                // Ejecutar el diseño
+                $service->spreadsheets->batchUpdate($spreadsheetId, $batchUpdateRequest);
+            }
+
+            Log::info("Gasto insertado y diseñado exitosamente en la fila: " . $filaDestino);
+        } elseif ($datos['accion'] === 'consultar') {
             Log::info("El usuario pidió consultar la fecha: " . $datos['fecha']);
         }
     }

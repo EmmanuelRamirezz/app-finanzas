@@ -35,4 +35,12 @@ return [
         ],
     ],
 
+    'whatsapp' => [
+        'verify_token' => env('WHATSAPP_VERIFY_TOKEN'),
+    ],
+    'google' => [
+        'credentials' => env('GOOGLE_CREDENTIALS_BASE64'),
+        'spreadsheet_id' => env('GOOGLE_SPREADSHEET_ID'),
+    ]
+
 ];
