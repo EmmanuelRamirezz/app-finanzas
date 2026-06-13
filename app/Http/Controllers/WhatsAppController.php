@@ -173,9 +173,25 @@ class WhatsAppController extends Controller
         }";
 
         try {
-            $response = Gemini::generativeModel(model: 'gemini-2.5-flash')
-                ->withSystemInstruction(Content::parse($systemPrompt))
-                ->generateContent($mensajeTexto);
+            // Envolvemos SOLO la llamada a Gemini.
+            // Argumentos: 3 intentos, la función a ejecutar, 2000ms de espera, y la condición para reintentar.
+            $response = retry(
+                3,
+                function () use ($systemPrompt, $mensajeTexto) {
+                    return Gemini::generativeModel(model: 'gemini-2.5-flash')
+                        ->withSystemInstruction(Content::parse($systemPrompt))
+                        ->generateContent($mensajeTexto);
+                },
+                2000,
+                function (\Exception $e) {
+                    // Esta es la condición: Solo reintenta si detecta alta demanda.
+                    // Si es otro error, ignora el reintento y se va directo al bloque catch.
+                    $mensajeError = $e->getMessage();
+                    return str_contains($mensajeError, 'high demand') ||
+                           str_contains($mensajeError, '503') ||
+                           str_contains($mensajeError, 'Too Many Requests');
+                }
+            );
 
             // Limpiamos la respuesta en caso de que la IA agregue espacios o saltos de línea
             $textoLimpio = trim($response->text());
@@ -193,17 +209,16 @@ class WhatsAppController extends Controller
             return null;
 
         } catch (\Exception $e) {
+            // Si llega a este punto, significa que ya falló las 3 veces,
+            // o que fue un error distinto a la saturación.
             $mensajeError = $e->getMessage();
 
-            // 1. Detectar si el error es por saturación / alta demanda en Gemini
             if (
                 str_contains($mensajeError, 'high demand') ||
                 str_contains($mensajeError, '503') ||
                 str_contains($mensajeError, 'Too Many Requests')
             ) {
-                Log::warning("Gemini con alta demanda detectado en el servicio. Relanzando excepción controlada.");
-
-                // Lanzamos una excepción personalizada o relanzamos la misma para que el controlador la cachee
+                Log::warning("Gemini con alta demanda detectado tras 3 intentos. Relanzando excepción controlada.");
                 throw new \Exception("GEMINI_OVERLOAD: " . $mensajeError);
             }
 
